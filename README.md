@@ -1,4 +1,4 @@
-# HTTP Prototype Runner
+# HTTP prototype generator
 
 A zero-runtime-dependency prototype tool driven by a CSV file. Each CSV row defines one localhost HTTP request and the response the local mock server should return.
 
@@ -47,7 +47,7 @@ Unsigned downloads can be quarantined by macOS. Symptoms can include the process
 For a trusted local/test copy, remove quarantine from the extracted package once:
 
 ```bash
-xattr -dr com.apple.quarantine /path/to/http-prototype-runner-package
+xattr -dr com.apple.quarantine /path/to/http-prototype-generator-package
 ```
 
 Then launch again. `sudo` is not required and does not solve Gatekeeper quarantine.
