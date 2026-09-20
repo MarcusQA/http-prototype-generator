@@ -7,6 +7,6 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o di
 CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/prototype-macos-arm64 .
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/prototype-linux-x64 .
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/prototype-linux-arm64 .
-cp prototype.csv dist/prototype.csv
+cp http_values.csv dist/http_values.csv
 chmod +x dist/prototype-macos-* dist/prototype-linux-* 2>/dev/null || true
-echo "Built binaries in dist/ (prototype.csv copied beside them for direct launch)"
+echo "Built binaries in dist/ (http_values.csv copied beside them for direct launch)"

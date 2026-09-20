@@ -66,7 +66,7 @@ type app struct {
 }
 
 func main() {
-	csvPath := flag.String("csv", "", "path to prototype CSV (default: prototype.csv beside the executable)")
+	csvPath := flag.String("csv", "", "path to HTTP values CSV (default: http_values.csv beside the executable)")
 	uiPort := flag.Int("ui-port", 9000, "port for the prototype UI")
 	noBrowser := flag.Bool("no-browser", false, "do not open the browser automatically")
 	flag.Parse()
@@ -147,7 +147,7 @@ func resolveCSVPath(requested string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve executable location: %w", err)
 	}
-	return filepath.Join(filepath.Dir(exe), "prototype.csv"), nil
+	return filepath.Join(filepath.Dir(exe), "http_values.csv"), nil
 }
 
 func loadCSV(path string) ([]interaction, error) {

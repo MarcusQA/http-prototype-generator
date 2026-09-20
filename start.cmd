@@ -8,5 +8,5 @@ if not exist "%BIN%" (
   echo Build the app first with build-all.ps1, or use a release package containing dist\.
   exit /b 1
 )
-"%BIN%" --csv "%~dp0prototype.csv" %*
+"%BIN%" --csv "%~dp0http_values.csv" %*
 endlocal

@@ -13,5 +13,5 @@ foreach ($t in $targets) {
   $env:GOOS=$t.os; $env:GOARCH=$t.arch
   go build -trimpath -ldflags="-s -w" -o (Join-Path "dist" $t.out) .
 }
-Copy-Item prototype.csv (Join-Path "dist" "prototype.csv") -Force
-Write-Host "Built binaries in dist/ (prototype.csv copied beside them for direct launch)"
+Copy-Item http_values.csv (Join-Path "dist" "http_values.csv") -Force
+Write-Host "Built binaries in dist/ (http_values.csv copied beside them for direct launch)"

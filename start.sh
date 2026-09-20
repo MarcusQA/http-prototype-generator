@@ -19,4 +19,4 @@ if [ ! -f "$BIN" ]; then
 fi
 
 chmod +x "$BIN" 2>/dev/null || true
-exec "$BIN" --csv "$DIR/prototype.csv" "$@"
+exec "$BIN" --csv "$DIR/http_values.csv" "$@"

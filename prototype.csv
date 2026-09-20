@@ -1,7 +1,0 @@
-name,method,port,path,query,request headers,request body,status code,response headers,response body
-Health check,GET,8081,/health,,,,200,Content-Type: application/json,"{""status"":""ok""}"
-Create customer,POST,8081,/customers,notify=true,"Content-Type: application/json
-X-Demo-User: alice
-Authorization: Bearer 12345","{""name"":""Alice""}",201,"Content-Type: application/json
-Location: /customers/123","{""id"":123,""name"":""Alice""}"
-Find customer,GET,8081,/customers/123,,Accept: application/json,,200,Content-Type: application/json,"{""id"":123,""name"":""Alice""}"

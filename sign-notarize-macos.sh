@@ -29,7 +29,7 @@ mkdir -p release
 for arch in x64 arm64; do
   tmp=$(mktemp -d)
   cp "dist/prototype-macos-$arch" "$tmp/prototype"
-  cp prototype.csv "$tmp/prototype.csv"
+  cp http_values.csv "$tmp/http_values.csv"
   ditto -c -k --keepParent "$tmp" "release/http-prototype-generator-macos-$arch.zip"
   xcrun notarytool submit "release/http-prototype-generator-macos-$arch.zip" \
     --keychain-profile "$NOTARY_PROFILE" --wait
