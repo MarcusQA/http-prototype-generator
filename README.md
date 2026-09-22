@@ -22,7 +22,7 @@ No Go installation is required when you distribute the prebuilt binaries.
 
 ### Recommended launch
 
-Keep `prototype.csv` in the package root and launch:
+Keep `http_values.csv` in the package root and launch:
 
 - **Windows:** double-click `start.cmd`
 - **macOS:** double-click `start-macos.command`, or run `./start.sh`
@@ -34,7 +34,7 @@ The app starts the localhost mock ports, starts the UI on `http://127.0.0.1:9000
 
 ### Direct binary launch
 
-The build process copies `prototype.csv` into `dist/`. If you directly double-click or run a binary in `dist/` with no CSV argument, the application looks for `prototype.csv` **beside that executable**, not in the process working directory.
+The build process copies `http_values.csv` into `dist/`. If you directly double-click or run a binary in `dist/` with no CSV argument, the application looks for `http_values.csv` **beside that executable**, not in the process working directory.
 
 You can provide a different CSV explicitly:
 
@@ -194,20 +194,20 @@ This format is suitable for macOS/Linux shells and cURL importers such as Bruno 
 For developers with Go installed:
 
 ```bash
-go run . --csv prototype.csv
+go run . --csv http_values.csv
 ```
 
 or:
 
 ```bash
 go build -o prototype .
-./prototype --csv prototype.csv
+./prototype --csv http_values.csv
 ```
 
 Useful flags:
 
 ```text
---csv FILE       CSV file; default is prototype.csv beside the executable
+--csv FILE       CSV file; default is http_values.csv beside the executable
 --ui-port PORT   browser UI port (default: 9000)
 --no-browser     do not launch the default browser
 ```
@@ -252,7 +252,7 @@ From PowerShell:
 ./build-all.ps1
 ```
 
-Both produce standalone Windows, macOS and Linux x64/ARM64 binaries under `dist/`, and copy `prototype.csv` beside them for direct launch.
+Both produce standalone Windows, macOS and Linux x64/ARM64 binaries under `dist/`, and copy `http_values.csv` beside them for direct launch.
 
 Go is needed only on the build machine, not on end-user machines.
 
