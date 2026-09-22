@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"encoding/csv"
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,19 +29,21 @@ import (
 var webFS embed.FS
 
 type interaction struct {
-	ID              int          `json:"id"`
-	Name            string       `json:"name,omitempty"`
-	Method          string       `json:"method"`
-	Port            int          `json:"port"`
-	Path            string       `json:"path"`
-	Query           string       `json:"query"`
-	RequestHeaders  []headerPair `json:"requestHeaders"`
-	RequestBody     string       `json:"requestBody"`
-	StatusCode      int          `json:"statusCode"`
-	ResponseHeaders []headerPair `json:"responseHeaders"`
-	ResponseBody    string       `json:"responseBody"`
-	URL             string       `json:"url"`
-	Curl            string       `json:"curl"`
+	ID                  int          `json:"id"`
+	Name                string       `json:"name,omitempty"`
+	Method              string       `json:"method"`
+	Port                int          `json:"port"`
+	Path                string       `json:"path"`
+	Query               string       `json:"query"`
+	RequestHeaders      []headerPair `json:"requestHeaders"`
+	RequestBody         string       `json:"requestBody"`
+	RequestBodyDisplay  string       `json:"requestBodyDisplay"`
+	StatusCode          int          `json:"statusCode"`
+	ResponseHeaders     []headerPair `json:"responseHeaders"`
+	ResponseBody        string       `json:"responseBody"`
+	ResponseBodyDisplay string       `json:"responseBodyDisplay"`
+	URL                 string       `json:"url"`
+	Curl                string       `json:"curl"`
 }
 
 type headerPair struct {
@@ -50,11 +52,12 @@ type headerPair struct {
 }
 
 type executeResult struct {
-	Status     string              `json:"status"`
-	StatusCode int                 `json:"statusCode"`
-	Headers    map[string][]string `json:"headers"`
-	Body       string              `json:"body"`
-	DurationMs int64               `json:"durationMs"`
+	Status      string              `json:"status"`
+	StatusCode  int                 `json:"statusCode"`
+	Headers     map[string][]string `json:"headers"`
+	Body        string              `json:"body"`
+	BodyDisplay string              `json:"bodyDisplay"`
+	DurationMs  int64               `json:"durationMs"`
 }
 
 type app struct {
@@ -66,7 +69,7 @@ type app struct {
 }
 
 func main() {
-	csvPath := flag.String("csv", "", "path to HTTP values CSV (default: http_values.csv beside the executable)")
+	csvPath := flag.String("csv", "", "path to prototype CSV (default: prototype.csv beside the executable)")
 	uiPort := flag.Int("ui-port", 9000, "port for the prototype UI")
 	noBrowser := flag.Bool("no-browser", false, "do not open the browser automatically")
 	flag.Parse()
@@ -147,7 +150,7 @@ func resolveCSVPath(requested string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve executable location: %w", err)
 	}
-	return filepath.Join(filepath.Dir(exe), "http_values.csv"), nil
+	return filepath.Join(filepath.Dir(exe), "prototype.csv"), nil
 }
 
 func loadCSV(path string) ([]interaction, error) {
@@ -214,6 +217,10 @@ func loadCSV(path string) ([]interaction, error) {
 			p = "/" + p
 		}
 		q := strings.TrimPrefix(strings.TrimSpace(get(rec, "query")), "?")
+		canonicalQ, err := canonicalizeQuery(q)
+		if err != nil {
+			return nil, fmt.Errorf("row %d: invalid query string: %w", line+2, err)
+		}
 		reqHeaders, err := parseHeaders(get(rec, "request headers"))
 		if err != nil {
 			return nil, fmt.Errorf("row %d request headers: %w", line+2, err)
@@ -223,8 +230,8 @@ func loadCSV(path string) ([]interaction, error) {
 			return nil, fmt.Errorf("row %d response headers: %w", line+2, err)
 		}
 		u := fmt.Sprintf("http://localhost:%d%s", port, p)
-		if q != "" {
-			u += "?" + q
+		if canonicalQ != "" {
+			u += "?" + canonicalQ
 		}
 		row := interaction{
 			ID:              len(out) + 1,
@@ -232,7 +239,7 @@ func loadCSV(path string) ([]interaction, error) {
 			Method:          method,
 			Port:            port,
 			Path:            p,
-			Query:           q,
+			Query:           canonicalQ,
 			RequestHeaders:  reqHeaders,
 			RequestBody:     get(rec, "request body"),
 			StatusCode:      status,
@@ -240,6 +247,8 @@ func loadCSV(path string) ([]interaction, error) {
 			ResponseBody:    get(rec, "response body"),
 			URL:             u,
 		}
+		row.RequestBodyDisplay = formatBodyForDisplay(row.RequestBody)
+		row.ResponseBodyDisplay = formatBodyForDisplay(row.ResponseBody)
 		row.Curl = buildCurl(row)
 		out = append(out, row)
 	}
@@ -322,7 +331,7 @@ func (a *app) handleMock(port int, w http.ResponseWriter, r *http.Request) {
 
 	var candidates []interaction
 	for _, row := range a.interactions {
-		if row.Port == port && row.Method == r.Method && row.Path == r.URL.Path && row.Query == r.URL.RawQuery {
+		if row.Port == port && row.Method == r.Method && row.Path == r.URL.Path && queriesMatch(row.Query, r.URL.RawQuery) {
 			candidates = append(candidates, row)
 		}
 	}
@@ -331,7 +340,7 @@ func (a *app) handleMock(port int, w http.ResponseWriter, r *http.Request) {
 		if !requestHeadersMatch(row.RequestHeaders, r.Header) {
 			continue
 		}
-		if row.RequestBody != string(body) {
+		if !requestBodiesMatch(row.RequestBody, body, row.RequestHeaders, r.Header) {
 			continue
 		}
 		for _, h := range row.ResponseHeaders {
@@ -354,6 +363,301 @@ func (a *app) handleMock(port int, w http.ResponseWriter, r *http.Request) {
 			"body":   string(body),
 		},
 	})
+}
+
+func canonicalizeQuery(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return "", err
+	}
+	for key := range values {
+		sort.Strings(values[key])
+	}
+	return values.Encode(), nil
+}
+
+func queriesMatch(expectedRaw, actualRaw string) bool {
+	expected, err := url.ParseQuery(expectedRaw)
+	if err != nil {
+		return false
+	}
+	actual, err := url.ParseQuery(actualRaw)
+	if err != nil {
+		return false
+	}
+	if len(expected) != len(actual) {
+		return false
+	}
+	for key, expectedValues := range expected {
+		actualValues, ok := actual[key]
+		if !ok || len(expectedValues) != len(actualValues) {
+			return false
+		}
+		e := append([]string(nil), expectedValues...)
+		a := append([]string(nil), actualValues...)
+		sort.Strings(e)
+		sort.Strings(a)
+		for i := range e {
+			if e[i] != a[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func normalizeLineEndings(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+func requestBodiesMatch(expected string, actual []byte, expectedHeaders []headerPair, actualHeaders http.Header) bool {
+	// Header arguments are intentionally not used to decide whether semantic
+	// JSON matching applies. If both bodies are valid JSON, JSON semantics win.
+	// This makes imported requests robust when clients rewrite Content-Type.
+	_ = expectedHeaders
+	_ = actualHeaders
+
+	expected = normalizeLineEndings(expected)
+	actualText := normalizeLineEndings(string(actual))
+
+	// Exact text after newline normalization is the cheapest match and handles
+	// ordinary non-JSON text across Windows/macOS/Linux line endings.
+	if expected == actualText {
+		return true
+	}
+
+	// If both bodies are valid JSON, compare parsed values. Insignificant
+	// whitespace, object member order, line endings and number spelling such as
+	// 1 versus 1.0 do not affect the match. Array order remains significant.
+	expectedJSON, expectedErr := decodeJSON(expected)
+	actualJSON, actualErr := decodeJSON(actualText)
+	if expectedErr == nil && actualErr == nil {
+		return jsonValuesEqual(expectedJSON, actualJSON)
+	}
+	return false
+}
+
+func formatBodyForDisplay(body string) string {
+	if body == "" {
+		return ""
+	}
+	normalized := normalizeLineEndings(body)
+	v, err := decodeJSON(normalized)
+	if err != nil {
+		return normalized
+	}
+	formatted, err := formatJSONValue(v)
+	if err != nil {
+		return normalized
+	}
+	return formatted
+}
+
+func formatJSONValue(v any) (string, error) {
+	var b strings.Builder
+	if err := writeJSONValue(&b, v, 0); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+func writeJSONValue(b *strings.Builder, v any, depth int) error {
+	indent := func(d int) { b.WriteString(strings.Repeat("  ", d)) }
+
+	switch x := v.(type) {
+	case nil:
+		b.WriteString("null")
+	case bool:
+		if x {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case string:
+		encoded, _ := json.Marshal(x)
+		b.Write(encoded)
+	case json.Number:
+		b.WriteString(canonicalJSONNumber(string(x)))
+	case []any:
+		if len(x) == 0 {
+			b.WriteString("[]")
+			return nil
+		}
+		b.WriteString("[\n")
+		for i, item := range x {
+			indent(depth + 1)
+			if err := writeJSONValue(b, item, depth+1); err != nil {
+				return err
+			}
+			if i < len(x)-1 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('\n')
+		}
+		indent(depth)
+		b.WriteByte(']')
+	case map[string]any:
+		if len(x) == 0 {
+			b.WriteString("{}")
+			return nil
+		}
+		keys := make([]string, 0, len(x))
+		for key := range x {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		b.WriteString("{\n")
+		for i, key := range keys {
+			indent(depth + 1)
+			encodedKey, _ := json.Marshal(key)
+			b.Write(encodedKey)
+			b.WriteString(": ")
+			if err := writeJSONValue(b, x[key], depth+1); err != nil {
+				return err
+			}
+			if i < len(keys)-1 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('\n')
+		}
+		indent(depth)
+		b.WriteByte('}')
+	default:
+		return fmt.Errorf("unsupported JSON value type %T", v)
+	}
+	return nil
+}
+
+func canonicalJSONNumber(s string) string {
+	original := s
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	}
+
+	mantissa := s
+	exponentText := "0"
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		mantissa = s[:i]
+		exponentText = s[i+1:]
+	}
+	exponent, ok := new(big.Int).SetString(exponentText, 10)
+	if !ok {
+		return original
+	}
+
+	integerPart := mantissa
+	fractionPart := ""
+	if i := strings.IndexByte(mantissa, '.'); i >= 0 {
+		integerPart = mantissa[:i]
+		fractionPart = mantissa[i+1:]
+	}
+	digits := integerPart + fractionPart
+	decimalPos := big.NewInt(int64(len(integerPart)))
+	decimalPos.Add(decimalPos, exponent)
+
+	for len(digits) > 0 && digits[0] == '0' {
+		digits = digits[1:]
+		decimalPos.Sub(decimalPos, big.NewInt(1))
+	}
+	if digits == "" {
+		return "0"
+	}
+	for len(digits) > 1 && digits[len(digits)-1] == '0' {
+		digits = digits[:len(digits)-1]
+	}
+
+	scientificExponent := new(big.Int).Sub(new(big.Int).Set(decimalPos), big.NewInt(1))
+	if scientificExponent.IsInt64() {
+		e := scientificExponent.Int64()
+		if e >= -6 && e <= 20 {
+			pos := int(e + 1)
+			var plain string
+			switch {
+			case pos <= 0:
+				plain = "0." + strings.Repeat("0", -pos) + digits
+			case pos >= len(digits):
+				plain = digits + strings.Repeat("0", pos-len(digits))
+			default:
+				plain = digits[:pos] + "." + digits[pos:]
+			}
+			return sign + plain
+		}
+	}
+
+	significand := digits[:1]
+	if len(digits) > 1 {
+		significand += "." + digits[1:]
+	}
+	return sign + significand + "e" + scientificExponent.String()
+}
+
+func decodeJSON(s string) (any, error) {
+	decoder := json.NewDecoder(strings.NewReader(s))
+	decoder.UseNumber()
+	var v any
+	if err := decoder.Decode(&v); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	return v, nil
+}
+
+func jsonValuesEqual(a, b any) bool {
+	switch av := a.(type) {
+	case nil:
+		return b == nil
+	case bool:
+		bv, ok := b.(bool)
+		return ok && av == bv
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case json.Number:
+		bv, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		ar, aok := new(big.Rat).SetString(string(av))
+		br, bok := new(big.Rat).SetString(string(bv))
+		return aok && bok && ar.Cmp(br) == 0
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !jsonValuesEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for key, value := range av {
+			other, ok := bv[key]
+			if !ok || !jsonValuesEqual(value, other) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func requestHeadersMatch(expected []headerPair, actual http.Header) bool {
@@ -408,7 +712,7 @@ func (a *app) handleExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, err := http.NewRequest(row.Method, row.URL, strings.NewReader(row.RequestBody))
+	req, err := http.NewRequest(row.Method, row.URL, strings.NewReader(row.RequestBodyDisplay))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -432,11 +736,12 @@ func (a *app) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := executeResult{
-		Status:     resp.Status,
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Header,
-		Body:       string(body),
-		DurationMs: time.Since(started).Milliseconds(),
+		Status:      resp.Status,
+		StatusCode:  resp.StatusCode,
+		Headers:     resp.Header,
+		Body:        string(body),
+		BodyDisplay: formatBodyForDisplay(string(body)),
+		DurationMs:  time.Since(started).Milliseconds(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
@@ -457,18 +762,22 @@ func serveEmbeddedUI(w http.ResponseWriter, r *http.Request) {
 }
 
 func buildCurl(row interaction) string {
-	var b strings.Builder
-	b.WriteString("curl --request ")
-	b.WriteString(shellQuote(row.Method))
-	b.WriteString(" --url ")
-	b.WriteString(shellQuote(row.URL))
-	for _, h := range row.RequestHeaders {
-		b.WriteString(" \\\n  --header ")
-		b.WriteString(shellQuote(h.Name + ": " + h.Value))
+	parts := []string{
+		"--request " + shellQuote(row.Method),
+		"--url " + shellQuote(row.URL),
 	}
-	if row.RequestBody != "" {
-		b.WriteString(" \\\n  --data-raw ")
-		b.WriteString(shellQuote(row.RequestBody))
+	for _, h := range row.RequestHeaders {
+		parts = append(parts, "--header "+shellQuote(http.CanonicalHeaderKey(h.Name)+": "+h.Value))
+	}
+	if row.RequestBodyDisplay != "" {
+		parts = append(parts, "--data-raw "+shellQuote(row.RequestBodyDisplay))
+	}
+
+	var b strings.Builder
+	b.WriteString("curl")
+	for _, part := range parts {
+		b.WriteString(" \\\n  ")
+		b.WriteString(part)
 	}
 	return b.String()
 }
@@ -503,7 +812,3 @@ func (a *app) shutdown() {
 		_ = ln.Close()
 	}
 }
-
-// Retain imports used by some Go versions' optimizer/build paths.
-var _ = bytes.MinRead
-var _ = url.QueryEscape

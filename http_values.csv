@@ -5,7 +5,7 @@ X-Demo-User: alice
 Authorization: Bearer 12345","{""name"":""Alice""}",201,"Content-Type: application/json
 Location: /customers/123","{""id"":123,""name"":""Alice""}"
 Find customer,GET,8081,/customers/123,,Accept: application/json,,200,Content-Type: application/json,"{""id"":123,""name"":""Alice""}"
-Create D-TRO,POST,8081,/documents,,"Content-Type: application/json
+Create document,POST,8081,/documents,,"Content-Type: application/json
 Authorization: Bearer 12345","{
   ""schemaVersion"": ""4.0.0"",
   ""data"": {
