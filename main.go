@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -28,11 +32,18 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+// buildID is replaced by the release build scripts with a UTC build identifier.
+// Keeping a default makes ordinary `go run .` development builds work.
+var buildID = "dev"
+
+const applicationID = "http-prototype-generator"
+
 type interaction struct {
 	ID                  int          `json:"id"`
 	Name                string       `json:"name,omitempty"`
 	Method              string       `json:"method"`
 	Port                int          `json:"port"`
+	EffectivePort       int          `json:"effectivePort"`
 	Path                string       `json:"path"`
 	Query               string       `json:"query"`
 	RequestHeaders      []headerPair `json:"requestHeaders"`
@@ -60,22 +71,66 @@ type executeResult struct {
 	DurationMs  int64               `json:"durationMs"`
 }
 
+type portMapping struct {
+	Requested int `json:"requested"`
+	Effective int `json:"effective"`
+}
+
+type appInfo struct {
+	Application     string        `json:"application"`
+	BuildID         string        `json:"buildId"`
+	CSV             string        `json:"csv"`
+	UIURL           string        `json:"uiUrl"`
+	RequestedUIPort int           `json:"requestedUiPort"`
+	UIPort          int           `json:"uiPort"`
+	PortMappings    []portMapping `json:"portMappings"`
+}
+
+type instanceMetadata struct {
+	Application string `json:"application"`
+	BuildID     string `json:"buildId"`
+	CSV         string `json:"csv"`
+	UIURL       string `json:"uiUrl"`
+	Token       string `json:"token"`
+	PID         int    `json:"pid"`
+	StartedAt   string `json:"startedAt"`
+}
+
+type instanceManager struct {
+	dir      string
+	metaPath string
+}
+
 type app struct {
-	interactions []interaction
-	byID         map[int]interaction
-	servers      []*http.Server
-	listeners    []net.Listener
-	mu           sync.Mutex
+	interactions    []interaction
+	byID            map[int]interaction
+	portMap         map[int]int
+	servers         []*http.Server
+	listeners       []net.Listener
+	uiServer        *http.Server
+	uiListener      net.Listener
+	uiURL           string
+	uiPort          int
+	requestedUIPort int
+	csvPath         string
+	controlToken    string
+	shutdownOnce    sync.Once
+	mu              sync.Mutex
 }
 
 func main() {
-	csvPath := flag.String("csv", "", "path to prototype CSV (default: http_values.csv beside the executable)")
-	uiPort := flag.Int("ui-port", 9000, "port for the prototype UI")
+	csvPath := flag.String("csv", "", "path to HTTP values CSV (default: http_values.csv beside the executable)")
+	uiPort := flag.Int("ui-port", 9000, "preferred port for the prototype UI; automatically remapped if unavailable")
 	noBrowser := flag.Bool("no-browser", false, "do not open the browser automatically")
+	replace := flag.Bool("replace", false, "replace an already-running instance for the same CSV")
+	exportPostman := flag.String("export-postman", "", "write a Postman v2.1 collection after ports are allocated")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
 		*csvPath = flag.Arg(0)
+	}
+	if *uiPort < 0 || *uiPort > 65535 {
+		log.Fatalf("invalid --ui-port %d", *uiPort)
 	}
 
 	resolvedCSV, err := resolveCSVPath(*csvPath)
@@ -83,6 +138,42 @@ func main() {
 		log.Fatalf("CSV error: %v", err)
 	}
 	*csvPath = resolvedCSV
+
+	mgr, err := newInstanceManager(*csvPath)
+	if err != nil {
+		log.Printf("Warning: single-instance management disabled: %v", err)
+	}
+	if mgr != nil {
+		if existing, live := mgr.liveInstance(); live {
+			if existing.BuildID == buildID && !*replace {
+				if *exportPostman != "" {
+					if err := downloadExistingCollection(existing.UIURL, *exportPostman); err != nil {
+						log.Fatalf("Could not export collection from running instance: %v", err)
+					}
+					log.Printf("Postman/Bruno collection written to %s", *exportPostman)
+				}
+				log.Printf("This CSV is already running (build %s): %s", existing.BuildID, existing.UIURL)
+				if !*noBrowser {
+					_ = openBrowser(existing.UIURL)
+				}
+				return
+			}
+
+			log.Printf("Replacing running instance for this CSV (old build %s, new build %s)", existing.BuildID, buildID)
+			if err := requestExistingShutdown(existing); err != nil {
+				log.Printf("Warning: could not request clean shutdown of the existing instance: %v", err)
+			}
+			if err := waitForInstanceToStop(existing.UIURL, 5*time.Second); err != nil {
+				log.Printf("Warning: existing instance did not confirm shutdown within 5s; continuing with automatic port remapping")
+			}
+		}
+		if err := mgr.acquire(); err != nil {
+			log.Printf("Warning: could not acquire instance lock: %v", err)
+			mgr = nil
+		} else {
+			defer mgr.release()
+		}
+	}
 
 	rows, err := loadCSV(*csvPath)
 	if err != nil {
@@ -92,39 +183,100 @@ func main() {
 		log.Fatal("CSV contains no request rows")
 	}
 
-	a := &app{interactions: rows, byID: make(map[int]interaction)}
-	for _, row := range rows {
-		a.byID[row.ID] = row
+	token, err := randomToken()
+	if err != nil {
+		log.Fatalf("Could not create control token: %v", err)
+	}
+	a := &app{
+		interactions:    rows,
+		byID:            make(map[int]interaction),
+		portMap:         make(map[int]int),
+		requestedUIPort: *uiPort,
+		csvPath:         *csvPath,
+		controlToken:    token,
 	}
 
 	if err := a.startMockServers(); err != nil {
 		log.Fatalf("Could not start mock server: %v", err)
 	}
 	defer a.shutdown()
+	a.refreshDerivedFields()
 
-	uiAddr := fmt.Sprintf("127.0.0.1:%d", *uiPort)
+	if *exportPostman != "" {
+		if err := a.writePostmanCollection(*exportPostman); err != nil {
+			log.Fatalf("Could not write Postman/Bruno collection: %v", err)
+		}
+		log.Printf("Postman/Bruno collection written to %s", *exportPostman)
+	}
+
+	uiListener, actualUIPort, err := listenPreferred(*uiPort)
+	if err != nil {
+		log.Fatalf("Could not start UI server: %v", err)
+	}
+	a.uiListener = uiListener
+	a.uiPort = actualUIPort
+	a.uiURL = fmt.Sprintf("http://127.0.0.1:%d/", actualUIPort)
+	if *uiPort != 0 && actualUIPort != *uiPort {
+		log.Printf("UI port %d is in use; using %d instead", *uiPort, actualUIPort)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/interactions", a.handleInteractions)
 	mux.HandleFunc("/api/execute", a.handleExecute)
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	mux.HandleFunc("/api/info", a.handleInfo)
+	mux.HandleFunc("/api/health", a.handleInfo)
+	mux.HandleFunc("/api/shutdown", a.handleShutdown)
+	mux.HandleFunc("/api/export/postman", a.handlePostmanExport)
 	mux.HandleFunc("/", serveEmbeddedUI)
+	a.uiServer = &http.Server{Handler: mux}
 
-	uiURL := fmt.Sprintf("http://%s/", uiAddr)
+	if mgr != nil {
+		meta := instanceMetadata{
+			Application: applicationID,
+			BuildID:     buildID,
+			CSV:         *csvPath,
+			UIURL:       a.uiURL,
+			Token:       token,
+			PID:         os.Getpid(),
+			StartedAt:   time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := mgr.write(meta); err != nil {
+			log.Printf("Warning: could not write instance metadata: %v", err)
+		}
+	}
+
 	log.Printf("Loaded %d request(s) from %s", len(rows), *csvPath)
-	log.Printf("Prototype UI: %s", uiURL)
+	for _, mapping := range a.sortedPortMappings() {
+		if mapping.Requested == mapping.Effective {
+			log.Printf("Mock server listening on http://localhost:%d", mapping.Effective)
+		} else {
+			log.Printf("Mock port %d is in use; mapped to http://localhost:%d", mapping.Requested, mapping.Effective)
+		}
+	}
+	log.Printf("Prototype UI: %s", a.uiURL)
+	log.Printf("Build: %s", buildID)
 	log.Printf("Press Ctrl+C to stop")
 
 	if !*noBrowser {
 		go func() {
 			time.Sleep(350 * time.Millisecond)
-			if err := openBrowser(uiURL); err != nil {
+			if err := openBrowser(a.uiURL); err != nil {
 				log.Printf("Could not open browser automatically: %v", err)
 			}
 		}()
 	}
 
-	if err := http.ListenAndServe(uiAddr, mux); err != nil {
-		log.Fatal(err)
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
+	go func() {
+		<-interrupt
+		log.Printf("Shutting down...")
+		a.shutdown()
+	}()
+
+	if err := a.uiServer.Serve(uiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("UI server stopped: %v", err)
 	}
 }
 
@@ -304,12 +456,35 @@ func (a *app) startMockServers() error {
 	}
 	sort.Ints(sorted)
 
-	for _, port := range sorted {
-		p := port
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+	// First reserve every requested port that is actually available. Only after
+	// that do we allocate ephemeral ports for conflicts. This prevents an
+	// ephemeral allocation from accidentally consuming another requested port.
+	listeners := make(map[int]net.Listener, len(sorted))
+	var conflicted []int
+	for _, requested := range sorted {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", requested))
 		if err != nil {
-			return fmt.Errorf("port %d: %w", p, err)
+			conflicted = append(conflicted, requested)
+			continue
 		}
+		listeners[requested] = ln
+		a.portMap[requested] = listenerPort(ln)
+	}
+	for _, requested := range conflicted {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			for _, open := range listeners {
+				_ = open.Close()
+			}
+			return fmt.Errorf("allocate fallback for requested port %d: %w", requested, err)
+		}
+		listeners[requested] = ln
+		a.portMap[requested] = listenerPort(ln)
+	}
+
+	for _, logicalPort := range sorted {
+		p := logicalPort
+		ln := listeners[p]
 		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			a.handleMock(p, w, r)
 		})}
@@ -317,12 +492,64 @@ func (a *app) startMockServers() error {
 		a.servers = append(a.servers, srv)
 		go func() {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("mock server on port %d stopped: %v", p, err)
+				log.Printf("mock server for requested port %d stopped: %v", p, err)
 			}
 		}()
-		log.Printf("Mock server listening on http://localhost:%d", p)
 	}
 	return nil
+}
+
+func listenPreferred(preferred int) (net.Listener, int, error) {
+	if preferred > 0 {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", preferred))
+		if err == nil {
+			return ln, listenerPort(ln), nil
+		}
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, 0, err
+	}
+	return ln, listenerPort(ln), nil
+}
+
+func listenerPort(ln net.Listener) int {
+	if addr, ok := ln.Addr().(*net.TCPAddr); ok {
+		return addr.Port
+	}
+	_, portText, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		return 0
+	}
+	port, _ := strconv.Atoi(portText)
+	return port
+}
+
+func (a *app) refreshDerivedFields() {
+	a.byID = make(map[int]interaction, len(a.interactions))
+	for i := range a.interactions {
+		row := &a.interactions[i]
+		effective := a.portMap[row.Port]
+		if effective == 0 {
+			effective = row.Port
+		}
+		row.EffectivePort = effective
+		row.URL = fmt.Sprintf("http://localhost:%d%s", effective, row.Path)
+		if row.Query != "" {
+			row.URL += "?" + row.Query
+		}
+		row.Curl = buildCurl(*row)
+		a.byID[row.ID] = *row
+	}
+}
+
+func (a *app) sortedPortMappings() []portMapping {
+	out := make([]portMapping, 0, len(a.portMap))
+	for requested, effective := range a.portMap {
+		out = append(out, portMapping{Requested: requested, Effective: effective})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Requested < out[j].Requested })
+	return out
 }
 
 func (a *app) handleMock(port int, w http.ResponseWriter, r *http.Request) {
@@ -747,6 +974,187 @@ func (a *app) handleExecute(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(result)
 }
 
+func (a *app) info() appInfo {
+	return appInfo{
+		Application:     applicationID,
+		BuildID:         buildID,
+		CSV:             a.csvPath,
+		UIURL:           a.uiURL,
+		RequestedUIPort: a.requestedUIPort,
+		UIPort:          a.uiPort,
+		PortMappings:    a.sortedPortMappings(),
+	}
+}
+
+func (a *app) handleInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(a.info())
+}
+
+func (a *app) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("X-Prototype-Token") != a.controlToken {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = io.WriteString(w, `{"status":"shutting down"}`)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		a.shutdown()
+	}()
+}
+
+func (a *app) handlePostmanExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := a.postmanCollectionJSON()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	filename := collectionFilename(a.csvPath)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
+	_, _ = w.Write(data)
+}
+
+func collectionFilename(csvPath string) string {
+	base := strings.TrimSuffix(filepath.Base(csvPath), filepath.Ext(csvPath))
+	if base == "" || base == "." {
+		base = "http-prototype"
+	}
+	return base + ".postman_collection.json"
+}
+
+func (a *app) writePostmanCollection(path string) error {
+	data, err := a.postmanCollectionJSON()
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(abs, data, 0o644)
+}
+
+func (a *app) postmanCollectionJSON() ([]byte, error) {
+	items := make([]any, 0, len(a.interactions))
+	for _, row := range a.interactions {
+		request := postmanRequest(row)
+		responseHeaders := make([]map[string]any, 0, len(row.ResponseHeaders))
+		for _, h := range row.ResponseHeaders {
+			responseHeaders = append(responseHeaders, map[string]any{"key": h.Name, "value": h.Value})
+		}
+		statusText := http.StatusText(row.StatusCode)
+		if statusText == "" {
+			statusText = "Configured response"
+		}
+		previewLanguage := "text"
+		if _, err := decodeJSON(row.ResponseBodyDisplay); err == nil && row.ResponseBodyDisplay != "" {
+			previewLanguage = "json"
+		}
+		response := map[string]any{
+			"name":                     fmt.Sprintf("%d %s", row.StatusCode, statusText),
+			"originalRequest":          request,
+			"status":                   statusText,
+			"code":                     row.StatusCode,
+			"_postman_previewlanguage": previewLanguage,
+			"header":                   responseHeaders,
+			"cookie":                   []any{},
+			"body":                     row.ResponseBodyDisplay,
+		}
+		name := row.Name
+		if name == "" {
+			name = fmt.Sprintf("%s %s", row.Method, row.Path)
+		}
+		items = append(items, map[string]any{
+			"name":     name,
+			"request":  request,
+			"response": []any{response},
+		})
+	}
+
+	name := strings.TrimSuffix(filepath.Base(a.csvPath), filepath.Ext(a.csvPath))
+	if name == "" || name == "." {
+		name = "HTTP Prototype"
+	}
+	collection := map[string]any{
+		"info": map[string]any{
+			"name":        name,
+			"description": "Generated by HTTP Prototype Generator. URLs use the effective localhost ports allocated for this running instance.",
+			"schema":      "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		},
+		"item": items,
+	}
+	return json.MarshalIndent(collection, "", "  ")
+}
+
+func postmanRequest(row interaction) map[string]any {
+	headers := make([]map[string]any, 0, len(row.RequestHeaders))
+	for _, h := range row.RequestHeaders {
+		headers = append(headers, map[string]any{"key": h.Name, "value": h.Value, "type": "text"})
+	}
+
+	pathParts := []string{}
+	for _, part := range strings.Split(strings.TrimPrefix(row.Path, "/"), "/") {
+		if part != "" {
+			pathParts = append(pathParts, part)
+		}
+	}
+	queryParts := []map[string]any{}
+	if row.Query != "" {
+		values, _ := url.ParseQuery(row.Query)
+		keys := make([]string, 0, len(values))
+		for key := range values {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			vals := append([]string(nil), values[key]...)
+			sort.Strings(vals)
+			for _, value := range vals {
+				queryParts = append(queryParts, map[string]any{"key": key, "value": value})
+			}
+		}
+	}
+
+	request := map[string]any{
+		"method": row.Method,
+		"header": headers,
+		"url": map[string]any{
+			"raw":      row.URL,
+			"protocol": "http",
+			"host":     []string{"localhost"},
+			"port":     strconv.Itoa(row.EffectivePort),
+			"path":     pathParts,
+			"query":    queryParts,
+		},
+	}
+	if row.RequestBodyDisplay != "" {
+		body := map[string]any{"mode": "raw", "raw": row.RequestBodyDisplay}
+		if _, err := decodeJSON(row.RequestBodyDisplay); err == nil {
+			body["options"] = map[string]any{"raw": map[string]any{"language": "json"}}
+		}
+		request["body"] = body
+	}
+	return request
+}
+
 func serveEmbeddedUI(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -787,6 +1195,163 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
+func randomToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func newInstanceManager(csvPath string) (*instanceManager, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		cacheDir = os.TempDir()
+	}
+	canonical := filepath.Clean(csvPath)
+	if runtime.GOOS == "windows" {
+		canonical = strings.ToLower(canonical)
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	key := hex.EncodeToString(sum[:12])
+	parent := filepath.Join(cacheDir, applicationID, "instances")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(parent, key)
+	return &instanceManager{dir: dir, metaPath: filepath.Join(dir, "instance.json")}, nil
+}
+
+func (m *instanceManager) acquire() error {
+	if err := os.Mkdir(m.dir, 0o700); err == nil {
+		return nil
+	} else if !os.IsExist(err) {
+		return err
+	}
+
+	// Existing directory with no responsive instance is stale (for example
+	// after a crash or power loss). Remove it and claim it atomically.
+	if _, live := m.liveInstance(); live {
+		return errors.New("instance is still running")
+	}
+	if err := os.RemoveAll(m.dir); err != nil {
+		return err
+	}
+	return os.Mkdir(m.dir, 0o700)
+}
+
+func (m *instanceManager) release() {
+	_ = os.RemoveAll(m.dir)
+}
+
+func (m *instanceManager) write(meta instanceMetadata) error {
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := m.metaPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, m.metaPath)
+}
+
+func (m *instanceManager) read() (instanceMetadata, error) {
+	var meta instanceMetadata
+	data, err := os.ReadFile(m.metaPath)
+	if err != nil {
+		return meta, err
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return meta, err
+	}
+	return meta, nil
+}
+
+func (m *instanceManager) liveInstance() (instanceMetadata, bool) {
+	meta, err := m.read()
+	if err != nil || meta.Application != applicationID || meta.UIURL == "" {
+		return instanceMetadata{}, false
+	}
+	client := &http.Client{Timeout: 700 * time.Millisecond}
+	resp, err := client.Get(strings.TrimRight(meta.UIURL, "/") + "/api/health")
+	if err != nil {
+		return instanceMetadata{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return instanceMetadata{}, false
+	}
+	var info appInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return instanceMetadata{}, false
+	}
+	if info.Application != applicationID || filepath.Clean(info.CSV) != filepath.Clean(meta.CSV) {
+		return instanceMetadata{}, false
+	}
+	return meta, true
+}
+
+func requestExistingShutdown(meta instanceMetadata) error {
+	if meta.UIURL == "" || meta.Token == "" {
+		return errors.New("existing instance has no control endpoint metadata")
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(meta.UIURL, "/")+"/api/shutdown", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Prototype-Token", meta.Token)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("shutdown endpoint returned %s", resp.Status)
+	}
+	return nil
+}
+
+func waitForInstanceToStop(uiURL string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	healthURL := strings.TrimRight(uiURL, "/") + "/api/health"
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(healthURL)
+		if err != nil {
+			return nil
+		}
+		_ = resp.Body.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	return errors.New("instance is still responding")
+}
+
+func downloadExistingCollection(uiURL, outputPath string) error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(strings.TrimRight(uiURL, "/") + "/api/export/postman")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("export endpoint returned %s", resp.Status)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(outputPath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(abs, data, 0o644)
+}
+
 func openBrowser(target string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -801,14 +1366,22 @@ func openBrowser(target string) error {
 }
 
 func (a *app) shutdown() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	for _, srv := range a.servers {
-		_ = srv.Shutdown(ctx)
-	}
-	for _, ln := range a.listeners {
-		_ = ln.Close()
-	}
+	a.shutdownOnce.Do(func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if a.uiServer != nil {
+			_ = a.uiServer.Shutdown(ctx)
+		}
+		for _, srv := range a.servers {
+			_ = srv.Shutdown(ctx)
+		}
+		if a.uiListener != nil {
+			_ = a.uiListener.Close()
+		}
+		for _, ln := range a.listeners {
+			_ = ln.Close()
+		}
+	})
 }

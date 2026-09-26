@@ -5,8 +5,17 @@ OS=$(uname -s)
 ARCH=$(uname -m)
 
 case "$OS:$ARCH" in
-  Darwin:arm64) BIN="$DIR/dist/prototype-macos-arm64" ;;
-  Darwin:x86_64) BIN="$DIR/dist/prototype-macos-x64" ;;
+  Darwin:*)
+    if [ -f "$DIR/dist/prototype-macos-universal" ]; then
+      BIN="$DIR/dist/prototype-macos-universal"
+    else
+      case "$ARCH" in
+        arm64|aarch64) BIN="$DIR/dist/prototype-macos-arm64" ;;
+        x86_64|amd64) BIN="$DIR/dist/prototype-macos-x64" ;;
+        *) echo "Unsupported macOS architecture: $ARCH" >&2; exit 1 ;;
+      esac
+    fi
+    ;;
   Linux:aarch64|Linux:arm64) BIN="$DIR/dist/prototype-linux-arm64" ;;
   Linux:x86_64|Linux:amd64) BIN="$DIR/dist/prototype-linux-x64" ;;
   *) echo "Unsupported platform: $OS $ARCH" >&2; exit 1 ;;

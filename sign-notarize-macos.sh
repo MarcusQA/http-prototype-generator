@@ -10,6 +10,9 @@ set -euo pipefail
 #   DEVELOPER_ID='Developer ID Application: Example Ltd (TEAMID)' ./sign-notarize-macos.sh
 # Optional:
 #   NOTARY_PROFILE=http-prototype-generator ./sign-notarize-macos.sh
+#
+# Run build-all.sh on macOS first. When Xcode's `lipo` is available that build
+# also creates dist/prototype-macos-universal containing amd64 + arm64 slices.
 
 DEVELOPER_ID=${DEVELOPER_ID:-}
 NOTARY_PROFILE=${NOTARY_PROFILE:-http-prototype-generator}
@@ -19,22 +22,28 @@ if [[ -z "$DEVELOPER_ID" ]]; then
   exit 2
 fi
 
-for bin in dist/prototype-macos-x64 dist/prototype-macos-arm64; do
+bins=(dist/prototype-macos-x64 dist/prototype-macos-arm64)
+if [[ -f dist/prototype-macos-universal ]]; then
+  bins+=(dist/prototype-macos-universal)
+fi
+
+for bin in "${bins[@]}"; do
   [[ -f "$bin" ]] || { echo "Missing $bin; run ./build-all.sh first." >&2; exit 1; }
   codesign --force --timestamp --options runtime --sign "$DEVELOPER_ID" "$bin"
   codesign --verify --strict --verbose=2 "$bin"
 done
 
 mkdir -p release
-for arch in x64 arm64; do
+for bin in "${bins[@]}"; do
+  name=$(basename "$bin")
   tmp=$(mktemp -d)
-  cp "dist/prototype-macos-$arch" "$tmp/prototype"
+  cp "$bin" "$tmp/prototype"
   cp http_values.csv "$tmp/http_values.csv"
-  ditto -c -k --keepParent "$tmp" "release/http-prototype-generator-macos-$arch.zip"
-  xcrun notarytool submit "release/http-prototype-generator-macos-$arch.zip" \
-    --keychain-profile "$NOTARY_PROFILE" --wait
+  zipfile="release/http-prototype-generator-${name#prototype-}.zip"
+  ditto -c -k --keepParent "$tmp" "$zipfile"
+  xcrun notarytool submit "$zipfile" --keychain-profile "$NOTARY_PROFILE" --wait
   rm -rf "$tmp"
 done
 
-echo "Signed and notarized release ZIPs are in release/."
+echo "Signed and notarized macOS release ZIPs are in release/."
 echo "Bare command-line executables cannot be stapled like an .app/.pkg; Gatekeeper can retrieve the notarization ticket online."

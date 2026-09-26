@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -148,5 +150,97 @@ func TestMockMatchesBrunoStyleJSONAndQuery(t *testing.T) {
 	}
 	if rr.Body.String() != `{"ok":true}` {
 		t.Fatalf("body = %q", rr.Body.String())
+	}
+}
+
+func TestStartMockServersRemapsOccupiedPort(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	requested := listenerPort(occupied)
+
+	a := &app{
+		interactions: []interaction{{
+			ID: 1, Method: http.MethodGet, Port: requested, Path: "/hello",
+			StatusCode: http.StatusOK, ResponseBody: `{"ok":true}`,
+		}},
+		byID:    make(map[int]interaction),
+		portMap: make(map[int]int),
+	}
+	if err := a.startMockServers(); err != nil {
+		t.Fatal(err)
+	}
+	defer a.shutdown()
+	a.refreshDerivedFields()
+	if a.portMap[requested] == requested {
+		t.Fatalf("expected occupied port %d to be remapped", requested)
+	}
+	resp, err := http.Get(a.interactions[0].URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d", resp.StatusCode)
+	}
+}
+
+func TestListenPreferredUsesFallback(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	preferred := listenerPort(occupied)
+	ln, actual, err := listenPreferred(preferred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if actual == preferred {
+		t.Fatalf("expected fallback from occupied port %d", preferred)
+	}
+}
+
+func TestPostmanCollectionUsesEffectivePortAndExamples(t *testing.T) {
+	a := &app{
+		csvPath: "/tmp/demo.csv",
+		interactions: []interaction{{
+			ID: 1, Name: "Create customer", Method: http.MethodPost,
+			Port: 8081, EffectivePort: 54321, Path: "/customers", Query: "a=1&b=2",
+			URL:                 "http://localhost:54321/customers?a=1&b=2",
+			RequestHeaders:      []headerPair{{Name: "Content-Type", Value: "application/json"}},
+			RequestBodyDisplay:  "{\n  \"name\": \"Alice\"\n}",
+			StatusCode:          201,
+			ResponseHeaders:     []headerPair{{Name: "Content-Type", Value: "application/json"}},
+			ResponseBodyDisplay: "{\n  \"id\": 1\n}",
+		}},
+	}
+	data, err := a.postmanCollectionJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var collection map[string]any
+	if err := json.Unmarshal(data, &collection); err != nil {
+		t.Fatal(err)
+	}
+	items := collection["item"].([]any)
+	item := items[0].(map[string]any)
+	req := item["request"].(map[string]any)
+	u := req["url"].(map[string]any)
+	if u["port"] != "54321" {
+		t.Fatalf("port = %#v", u["port"])
+	}
+	responses := item["response"].([]any)
+	if len(responses) != 1 {
+		t.Fatalf("response examples = %d", len(responses))
+	}
+}
+
+func TestCollectionFilename(t *testing.T) {
+	if got := collectionFilename(`/tmp/http_values.csv`); got != "http_values.postman_collection.json" {
+		t.Fatalf("got %q", got)
 	}
 }
