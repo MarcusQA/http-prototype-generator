@@ -23,6 +23,7 @@ cp http_values.csv release/macos/dist/http_values.csv
 
 if command -v zip >/dev/null 2>&1; then
   (cd release/windows && zip -qr ../http-prototype-generator-windows.zip .)
+  (cd release/linux && zip -qr ../http-prototype-generator-linux.zip .)
   (cd release/macos && zip -qr ../http-prototype-generator-macos.zip .)
 fi
 if command -v tar >/dev/null 2>&1; then

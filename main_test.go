@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -242,5 +243,81 @@ func TestPostmanCollectionUsesEffectivePortAndExamples(t *testing.T) {
 func TestCollectionFilename(t *testing.T) {
 	if got := collectionFilename(`/tmp/http_values.csv`); got != "http_values.postman_collection.json" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestReconcileMockServersReloadsRowsWithoutRestart(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requested := listenerPort(probe)
+	_ = probe.Close()
+
+	a := &app{
+		interactions: []interaction{{
+			ID: 1, Method: http.MethodGet, Port: requested, Path: "/live",
+			StatusCode: http.StatusOK, ResponseBody: `{"version":1}`,
+		}},
+		byID:         make(map[int]interaction),
+		portMap:      make(map[int]int),
+		mockServers:  make(map[int]*mockServer),
+		eventClients: make(map[chan reloadEvent]struct{}),
+		done:         make(chan struct{}),
+		csvRevision:  1,
+	}
+	if err := a.startMockServers(); err != nil {
+		t.Fatal(err)
+	}
+	defer a.shutdown()
+	a.refreshDerivedFields()
+
+	a.stateMu.RLock()
+	url := a.interactions[0].URL
+	a.stateMu.RUnlock()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != `{"version":1}` {
+		t.Fatalf("initial body = %q", body)
+	}
+
+	updated := []interaction{{
+		ID: 1, Method: http.MethodGet, Port: requested, Path: "/live",
+		StatusCode: http.StatusOK, ResponseBody: `{"version":2}`,
+		ResponseBodyDisplay: `{
+  "version": 2
+}`,
+	}}
+	if err := a.reconcileMockServers(updated); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err = http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != `{"version":2}` {
+		t.Fatalf("reloaded body = %q", body)
+	}
+
+	a.stateMu.RLock()
+	revision := a.csvRevision
+	a.stateMu.RUnlock()
+	if revision != 2 {
+		t.Fatalf("revision = %d, want 2", revision)
+	}
+}
+
+func TestParseCSVRejectsInvalidReloadData(t *testing.T) {
+	bad := []byte("method,port,path,query,request headers,request body,status code,response headers,response body\nGET,8081,/x,,,,20A,,\n")
+	if _, err := parseCSV(bad); err == nil {
+		t.Fatal("expected invalid status code to fail parsing")
 	}
 }

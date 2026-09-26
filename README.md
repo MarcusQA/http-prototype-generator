@@ -4,6 +4,20 @@ A zero-runtime-dependency localhost HTTP prototype driven by a CSV file. Each CS
 
 ## Highlights in this version
 
+### Automatic CSV reload and live browser refresh
+
+The app watches `http_values.csv` while it is running. Saving the CSV in Excel, LibreOffice, Numbers, or another editor automatically reloads the prototype; you do **not** need to restart the executable or refresh the browser manually.
+
+- The file is checked for content changes several times per second using a SHA-256 fingerprint, so atomic-save/rename behaviour from spreadsheet editors is handled reliably.
+- Valid changes are parsed and applied atomically.
+- The browser receives a Server-Sent Event (SSE) and refreshes the request cards immediately.
+- A slow browser-side revision poll is retained as a fallback after sleep/network interruption.
+- If the changed CSV is invalid, the running mock continues using the **previous valid configuration** and the UI displays the validation error.
+- If the set of CSV `port` values changes, mock listeners are reconciled automatically. Existing logical ports keep their listeners; removed ports are stopped; new ports are started and automatically remapped when necessary.
+- Generated cURLs and Postman/Bruno exports always reflect the latest valid CSV and the currently effective ports.
+
+The UI shows the current CSV revision and last successful reload time.
+
 ### Automatic port allocation
 
 The `port` column remains the requested/logical mock port. The app first tries to bind that exact port. If it is already occupied, the OS chooses a free localhost port instead.
@@ -23,16 +37,30 @@ Mock listeners are reserved before the UI listener, so if the CSV itself request
 
 ### Relaunching while an instance is already running
 
-Instances are keyed by the absolute CSV path. This means two different CSV files can run at the same time, while launching the same CSV twice is handled deliberately.
+Instances are keyed by the absolute CSV path. Two different CSV files can run at the same time, but relaunching the same CSV now means **restart this prototype**.
 
-- If the same CSV is already running with the **same build**, the second launch opens the existing UI and exits.
-- If the same CSV is already running with a **different build**, the new binary requests a clean shutdown of the old build, waits briefly, then starts itself.
-- `--replace` forces replacement even when the build IDs are the same. This is useful with local `go run` / `go build` development builds, which default to build ID `dev`.
-- If an old process crashed, stale instance metadata is removed automatically on the next launch.
+By default, the new process:
 
-The control endpoint is bound only to localhost and shutdown requires a random per-process token stored in the user's cache directory.
+1. detects the existing instance,
+2. requests a clean authenticated shutdown over localhost,
+3. waits for its UI and mock listeners to close,
+4. starts the newly launched process.
 
-**First upgrade note:** releases from before this single-instance mechanism do not create instance metadata or expose the authenticated shutdown endpoint. Stop such an older release manually once. Subsequent upgrades can replace running instances automatically.
+If clean shutdown fails, the launcher uses the recorded process ID as a last-resort forced stop. A hard kill is therefore a fallback, not the normal shutdown mechanism.
+
+This behaviour is useful when relaunching after replacing/updating a binary: the old executable cannot silently remain active on old ports while the new executable starts elsewhere.
+
+Use:
+
+```text
+--reuse-running
+```
+
+if you deliberately want the old behaviour: open the already-running UI and exit the second process. `--replace` is still accepted for compatibility with existing scripts, but replacement is now the default.
+
+Because CSV changes reload automatically, there is normally no need to relaunch merely after editing `http_values.csv`.
+
+**First upgrade note:** releases from before the single-instance mechanism do not create instance metadata or expose the authenticated shutdown endpoint. Stop such an older release manually once. Subsequent versions can replace running instances automatically.
 
 ### Postman / Bruno collection export
 
@@ -70,6 +98,8 @@ Keep `http_values.csv` in the package root and launch:
 - **Linux:** run `./start.sh`
 
 The launchers select the native x64/ARM64 executable automatically.
+
+After the browser opens, edit and save `http_values.csv` normally. The page refreshes its prototype cards automatically when a valid change is detected.
 
 ### Can there be only one binary per operating system?
 
@@ -201,7 +231,8 @@ Useful options:
 --csv FILE              CSV file; defaults to http_values.csv beside the executable
 --ui-port PORT          preferred UI port; defaults to 9000 and falls back automatically
 --no-browser            do not open the default browser
---replace               replace the running instance for the same CSV
+--reuse-running         open the existing instance instead of restarting it
+--replace               retained for compatibility; restarting is now the default
 --export-postman FILE   write a Postman v2.1 collection after ports are allocated
 ```
 

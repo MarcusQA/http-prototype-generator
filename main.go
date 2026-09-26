@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -84,6 +85,9 @@ type appInfo struct {
 	RequestedUIPort int           `json:"requestedUiPort"`
 	UIPort          int           `json:"uiPort"`
 	PortMappings    []portMapping `json:"portMappings"`
+	CSVRevision     int64         `json:"csvRevision"`
+	LastReloadAt    string        `json:"lastReloadAt,omitempty"`
+	ReloadError     string        `json:"reloadError,omitempty"`
 }
 
 type instanceMetadata struct {
@@ -101,12 +105,24 @@ type instanceManager struct {
 	metaPath string
 }
 
+type mockServer struct {
+	logicalPort   int
+	effectivePort int
+	server        *http.Server
+	listener      net.Listener
+}
+
+type reloadEvent struct {
+	Type       string `json:"type"`
+	Revision   int64  `json:"revision"`
+	Message    string `json:"message,omitempty"`
+	ReloadedAt string `json:"reloadedAt,omitempty"`
+}
+
 type app struct {
 	interactions    []interaction
 	byID            map[int]interaction
 	portMap         map[int]int
-	servers         []*http.Server
-	listeners       []net.Listener
 	uiServer        *http.Server
 	uiListener      net.Listener
 	uiURL           string
@@ -114,15 +130,25 @@ type app struct {
 	requestedUIPort int
 	csvPath         string
 	controlToken    string
-	shutdownOnce    sync.Once
-	mu              sync.Mutex
+	csvRevision     int64
+	lastReloadAt    string
+	reloadError     string
+
+	stateMu      sync.RWMutex
+	mockMu       sync.Mutex
+	mockServers  map[int]*mockServer
+	eventsMu     sync.Mutex
+	eventClients map[chan reloadEvent]struct{}
+	done         chan struct{}
+	shutdownOnce sync.Once
 }
 
 func main() {
 	csvPath := flag.String("csv", "", "path to HTTP values CSV (default: http_values.csv beside the executable)")
 	uiPort := flag.Int("ui-port", 9000, "preferred port for the prototype UI; automatically remapped if unavailable")
 	noBrowser := flag.Bool("no-browser", false, "do not open the browser automatically")
-	replace := flag.Bool("replace", false, "replace an already-running instance for the same CSV")
+	reuseRunning := flag.Bool("reuse-running", false, "open an already-running instance for the same CSV instead of restarting it")
+	replace := flag.Bool("replace", false, "restart an already-running instance (retained for compatibility; restarting is now the default)")
 	exportPostman := flag.String("export-postman", "", "write a Postman v2.1 collection after ports are allocated")
 	flag.Parse()
 
@@ -145,7 +171,7 @@ func main() {
 	}
 	if mgr != nil {
 		if existing, live := mgr.liveInstance(); live {
-			if existing.BuildID == buildID && !*replace {
+			if *reuseRunning && !*replace {
 				if *exportPostman != "" {
 					if err := downloadExistingCollection(existing.UIURL, *exportPostman); err != nil {
 						log.Fatalf("Could not export collection from running instance: %v", err)
@@ -159,12 +185,18 @@ func main() {
 				return
 			}
 
-			log.Printf("Replacing running instance for this CSV (old build %s, new build %s)", existing.BuildID, buildID)
-			if err := requestExistingShutdown(existing); err != nil {
-				log.Printf("Warning: could not request clean shutdown of the existing instance: %v", err)
+			log.Printf("Restarting running instance for this CSV (old build %s, new build %s)", existing.BuildID, buildID)
+			shutdownErr := requestExistingShutdown(existing)
+			if shutdownErr != nil {
+				log.Printf("Warning: could not request clean shutdown of the existing instance: %v", shutdownErr)
 			}
 			if err := waitForInstanceToStop(existing.UIURL, 5*time.Second); err != nil {
-				log.Printf("Warning: existing instance did not confirm shutdown within 5s; continuing with automatic port remapping")
+				log.Printf("Warning: existing instance did not stop cleanly within 5s; attempting a forced stop")
+				if killErr := forceStopExisting(existing); killErr != nil {
+					log.Printf("Warning: could not force-stop existing process %d: %v", existing.PID, killErr)
+				} else if waitErr := waitForInstanceToStop(existing.UIURL, 2*time.Second); waitErr != nil {
+					log.Printf("Warning: old instance still appears responsive; startup will continue with automatic port remapping")
+				}
 			}
 		}
 		if err := mgr.acquire(); err != nil {
@@ -194,6 +226,11 @@ func main() {
 		requestedUIPort: *uiPort,
 		csvPath:         *csvPath,
 		controlToken:    token,
+		csvRevision:     1,
+		lastReloadAt:    time.Now().Format(time.RFC3339),
+		mockServers:     make(map[int]*mockServer),
+		eventClients:    make(map[chan reloadEvent]struct{}),
+		done:            make(chan struct{}),
 	}
 
 	if err := a.startMockServers(); err != nil {
@@ -225,6 +262,7 @@ func main() {
 	mux.HandleFunc("/api/execute", a.handleExecute)
 	mux.HandleFunc("/api/info", a.handleInfo)
 	mux.HandleFunc("/api/health", a.handleInfo)
+	mux.HandleFunc("/api/events", a.handleEvents)
 	mux.HandleFunc("/api/shutdown", a.handleShutdown)
 	mux.HandleFunc("/api/export/postman", a.handlePostmanExport)
 	mux.HandleFunc("/", serveEmbeddedUI)
@@ -244,6 +282,8 @@ func main() {
 			log.Printf("Warning: could not write instance metadata: %v", err)
 		}
 	}
+
+	go a.watchCSV()
 
 	log.Printf("Loaded %d request(s) from %s", len(rows), *csvPath)
 	for _, mapping := range a.sortedPortMappings() {
@@ -306,13 +346,15 @@ func resolveCSVPath(requested string) (string, error) {
 }
 
 func loadCSV(path string) ([]interaction, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	return parseCSV(data)
+}
 
-	r := csv.NewReader(f)
+func parseCSV(data []byte) ([]interaction, error) {
+	r := csv.NewReader(bytes.NewReader(data))
 	r.FieldsPerRecord = -1
 	r.TrimLeadingSpace = false
 	records, err := r.ReadAll()
@@ -445,30 +487,43 @@ func parseHeaders(cell string) ([]headerPair, error) {
 	return out, nil
 }
 
+func portsForRows(rows []interaction) []int {
+	seen := make(map[int]bool)
+	for _, row := range rows {
+		seen[row.Port] = true
+	}
+	ports := make([]int, 0, len(seen))
+	for port := range seen {
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+	return ports
+}
+
 func (a *app) startMockServers() error {
-	ports := map[int]bool{}
-	for _, row := range a.interactions {
-		ports[row.Port] = true
+	if a.mockServers == nil {
+		a.mockServers = make(map[int]*mockServer)
 	}
-	var sorted []int
-	for p := range ports {
-		sorted = append(sorted, p)
+	a.stateMu.Lock()
+	if a.portMap == nil {
+		a.portMap = make(map[int]int)
 	}
-	sort.Ints(sorted)
+	a.stateMu.Unlock()
+
+	ports := portsForRows(a.interactions)
 
 	// First reserve every requested port that is actually available. Only after
 	// that do we allocate ephemeral ports for conflicts. This prevents an
 	// ephemeral allocation from accidentally consuming another requested port.
-	listeners := make(map[int]net.Listener, len(sorted))
+	listeners := make(map[int]net.Listener, len(ports))
 	var conflicted []int
-	for _, requested := range sorted {
+	for _, requested := range ports {
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", requested))
 		if err != nil {
 			conflicted = append(conflicted, requested)
 			continue
 		}
 		listeners[requested] = ln
-		a.portMap[requested] = listenerPort(ln)
 	}
 	for _, requested := range conflicted {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -479,23 +534,132 @@ func (a *app) startMockServers() error {
 			return fmt.Errorf("allocate fallback for requested port %d: %w", requested, err)
 		}
 		listeners[requested] = ln
-		a.portMap[requested] = listenerPort(ln)
 	}
 
-	for _, logicalPort := range sorted {
+	a.mockMu.Lock()
+	defer a.mockMu.Unlock()
+
+	a.stateMu.Lock()
+	for _, logicalPort := range ports {
+		ln := listeners[logicalPort]
+		a.portMap[logicalPort] = listenerPort(ln)
+	}
+	a.stateMu.Unlock()
+
+	for _, logicalPort := range ports {
 		p := logicalPort
 		ln := listeners[p]
 		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			a.handleMock(p, w, r)
 		})}
-		a.listeners = append(a.listeners, ln)
-		a.servers = append(a.servers, srv)
-		go func() {
-			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("mock server for requested port %d stopped: %v", p, err)
-			}
-		}()
+		ms := &mockServer{
+			logicalPort:   p,
+			effectivePort: listenerPort(ln),
+			server:        srv,
+			listener:      ln,
+		}
+		a.mockServers[p] = ms
+		go serveMock(ms)
 	}
+	return nil
+}
+
+func serveMock(ms *mockServer) {
+	if err := ms.server.Serve(ms.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("mock server for requested port %d stopped: %v", ms.logicalPort, err)
+	}
+}
+
+func (a *app) reconcileMockServers(rows []interaction) error {
+	newPorts := portsForRows(rows)
+	newSet := make(map[int]bool, len(newPorts))
+	for _, port := range newPorts {
+		newSet[port] = true
+	}
+
+	a.mockMu.Lock()
+	defer a.mockMu.Unlock()
+
+	// Stop logical ports that disappeared. This releases their sockets before
+	// newly-added logical ports are allocated.
+	for logicalPort, ms := range a.mockServers {
+		if newSet[logicalPort] {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = ms.server.Shutdown(ctx)
+		cancel()
+		_ = ms.listener.Close()
+		delete(a.mockServers, logicalPort)
+	}
+
+	var additions []int
+	for _, logicalPort := range newPorts {
+		if _, ok := a.mockServers[logicalPort]; !ok {
+			additions = append(additions, logicalPort)
+		}
+	}
+
+	created := make(map[int]*mockServer)
+	var conflicted []int
+	for _, requested := range additions {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", requested))
+		if err != nil {
+			conflicted = append(conflicted, requested)
+			continue
+		}
+		p := requested
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			a.handleMock(p, w, r)
+		})}
+		created[p] = &mockServer{logicalPort: p, effectivePort: listenerPort(ln), server: srv, listener: ln}
+	}
+	for _, requested := range conflicted {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			for _, ms := range created {
+				_ = ms.listener.Close()
+			}
+			return fmt.Errorf("allocate fallback for requested port %d: %w", requested, err)
+		}
+		p := requested
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			a.handleMock(p, w, r)
+		})}
+		created[p] = &mockServer{logicalPort: p, effectivePort: listenerPort(ln), server: srv, listener: ln}
+	}
+
+	portMap := make(map[int]int, len(a.mockServers)+len(created))
+	for logicalPort, ms := range a.mockServers {
+		portMap[logicalPort] = ms.effectivePort
+	}
+	for logicalPort, ms := range created {
+		portMap[logicalPort] = ms.effectivePort
+		a.mockServers[logicalPort] = ms
+	}
+
+	reloadedAt := time.Now().Format(time.RFC3339)
+	a.stateMu.Lock()
+	a.interactions = rows
+	a.portMap = portMap
+	a.csvRevision++
+	a.lastReloadAt = reloadedAt
+	a.reloadError = ""
+	a.refreshDerivedFieldsLocked()
+	revision := a.csvRevision
+	a.stateMu.Unlock()
+
+	// Start new servers only after the new interaction state is visible.
+	for _, ms := range created {
+		go serveMock(ms)
+	}
+
+	a.notifyReload(reloadEvent{
+		Type:       "csv-reloaded",
+		Revision:   revision,
+		Message:    fmt.Sprintf("Reloaded %d request(s)", len(rows)),
+		ReloadedAt: reloadedAt,
+	})
 	return nil
 }
 
@@ -526,6 +690,12 @@ func listenerPort(ln net.Listener) int {
 }
 
 func (a *app) refreshDerivedFields() {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.refreshDerivedFieldsLocked()
+}
+
+func (a *app) refreshDerivedFieldsLocked() {
 	a.byID = make(map[int]interaction, len(a.interactions))
 	for i := range a.interactions {
 		row := &a.interactions[i]
@@ -543,13 +713,19 @@ func (a *app) refreshDerivedFields() {
 	}
 }
 
-func (a *app) sortedPortMappings() []portMapping {
-	out := make([]portMapping, 0, len(a.portMap))
-	for requested, effective := range a.portMap {
+func sortedPortMappingsFrom(portMap map[int]int) []portMapping {
+	out := make([]portMapping, 0, len(portMap))
+	for requested, effective := range portMap {
 		out = append(out, portMapping{Requested: requested, Effective: effective})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Requested < out[j].Requested })
 	return out
+}
+
+func (a *app) sortedPortMappings() []portMapping {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return sortedPortMappingsFrom(a.portMap)
 }
 
 func (a *app) handleMock(port int, w http.ResponseWriter, r *http.Request) {
@@ -557,11 +733,13 @@ func (a *app) handleMock(port int, w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	var candidates []interaction
+	a.stateMu.RLock()
 	for _, row := range a.interactions {
 		if row.Port == port && row.Method == r.Method && row.Path == r.URL.Path && queriesMatch(row.Query, r.URL.RawQuery) {
 			candidates = append(candidates, row)
 		}
 	}
+	a.stateMu.RUnlock()
 
 	for _, row := range candidates {
 		if !requestHeadersMatch(row.RequestHeaders, r.Header) {
@@ -914,13 +1092,210 @@ func requestHeadersMatch(expected []headerPair, actual http.Header) bool {
 	return true
 }
 
+func (a *app) watchCSV() {
+	data, err := os.ReadFile(a.csvPath)
+	var lastSeen [32]byte
+	if err == nil {
+		lastSeen = sha256.Sum256(data)
+	}
+
+	// Spreadsheet programs commonly save by truncating/re-writing or by
+	// replacing the file. Poll frequently, require changed bytes to remain
+	// stable across two polls, and give invalid intermediate content a grace
+	// period before surfacing an error.
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+
+	var pendingHash [32]byte
+	var pendingData []byte
+	pending := false
+	readErrorCount := 0
+
+	var invalidHash [32]byte
+	var invalidSince time.Time
+	invalidPending := false
+
+	for {
+		select {
+		case <-a.done:
+			return
+		case <-ticker.C:
+			data, err := os.ReadFile(a.csvPath)
+			if err != nil {
+				readErrorCount++
+				pending = false
+				if readErrorCount >= 5 {
+					a.setReloadError(fmt.Sprintf("Could not read CSV: %v", err))
+				}
+				continue
+			}
+			readErrorCount = 0
+
+			hash := sha256.Sum256(data)
+			if hash == lastSeen {
+				pending = false
+				invalidPending = false
+				continue
+			}
+
+			if !pending || hash != pendingHash {
+				pendingHash = hash
+				pendingData = append(pendingData[:0], data...)
+				pending = true
+				continue
+			}
+
+			// The changed bytes were identical on two consecutive polls.
+			data = append([]byte(nil), pendingData...)
+			pending = false
+
+			rows, parseErr := parseCSV(data)
+			if parseErr != nil || len(rows) == 0 {
+				message := "CSV reload failed: CSV contains no request rows"
+				if parseErr != nil {
+					message = fmt.Sprintf("CSV reload failed: %v", parseErr)
+				}
+
+				// Empty/partial files are common for a fraction of a second while
+				// spreadsheet software saves. Only report invalid content if the
+				// exact invalid bytes remain unchanged for at least 1.5 seconds.
+				if !invalidPending || hash != invalidHash {
+					invalidHash = hash
+					invalidSince = time.Now()
+					invalidPending = true
+					continue
+				}
+				if time.Since(invalidSince) < 1500*time.Millisecond {
+					continue
+				}
+				lastSeen = hash
+				invalidPending = false
+				a.setReloadError(message)
+				continue
+			}
+
+			invalidPending = false
+			if err := a.reconcileMockServers(rows); err != nil {
+				// Listener allocation failures are not normally transient file
+				// writes, so report them immediately. Keep retrying only after
+				// the CSV bytes change again.
+				lastSeen = hash
+				a.setReloadError(fmt.Sprintf("CSV reload failed while updating mock ports: %v", err))
+				continue
+			}
+			lastSeen = hash
+
+			log.Printf("Automatically reloaded %d request(s) from %s", len(rows), a.csvPath)
+			for _, mapping := range a.sortedPortMappings() {
+				if mapping.Requested == mapping.Effective {
+					log.Printf("Mock server listening on http://localhost:%d", mapping.Effective)
+				} else {
+					log.Printf("Mock port %d is in use; mapped to http://localhost:%d", mapping.Requested, mapping.Effective)
+				}
+			}
+		}
+	}
+}
+
+func (a *app) setReloadError(message string) {
+	a.stateMu.Lock()
+	if a.reloadError == message {
+		a.stateMu.Unlock()
+		return
+	}
+	a.reloadError = message
+	revision := a.csvRevision
+	a.stateMu.Unlock()
+
+	log.Printf("%s; continuing to use the previous valid CSV configuration", message)
+	a.notifyReload(reloadEvent{
+		Type:     "csv-error",
+		Revision: revision,
+		Message:  message,
+	})
+}
+
+func (a *app) notifyReload(event reloadEvent) {
+	a.eventsMu.Lock()
+	defer a.eventsMu.Unlock()
+	for client := range a.eventClients {
+		select {
+		case client <- event:
+		default:
+			// Do not let a slow/disconnected browser block CSV reloading.
+		}
+	}
+}
+
+func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	client := make(chan reloadEvent, 8)
+	a.eventsMu.Lock()
+	a.eventClients[client] = struct{}{}
+	a.eventsMu.Unlock()
+	defer func() {
+		a.eventsMu.Lock()
+		delete(a.eventClients, client)
+		a.eventsMu.Unlock()
+	}()
+
+	info := a.info()
+	initial := reloadEvent{Type: "connected", Revision: info.CSVRevision, ReloadedAt: info.LastReloadAt}
+	if data, err := json.Marshal(initial); err == nil {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-a.done:
+			return
+		case <-heartbeat.C:
+			_, _ = io.WriteString(w, ": keepalive\n\n")
+			flusher.Flush()
+		case event := <-client:
+			data, err := json.Marshal(event)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 func (a *app) handleInteractions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	a.stateMu.RLock()
+	rows := append([]interaction(nil), a.interactions...)
+	a.stateMu.RUnlock()
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(a.interactions)
+	_ = json.NewEncoder(w).Encode(rows)
 }
 
 func (a *app) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -933,7 +1308,9 @@ func (a *app) handleExecute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
+	a.stateMu.RLock()
 	row, ok := a.byID[id]
+	a.stateMu.RUnlock()
 	if !ok {
 		http.Error(w, "unknown id", http.StatusNotFound)
 		return
@@ -975,6 +1352,8 @@ func (a *app) handleExecute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) info() appInfo {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
 	return appInfo{
 		Application:     applicationID,
 		BuildID:         buildID,
@@ -982,7 +1361,10 @@ func (a *app) info() appInfo {
 		UIURL:           a.uiURL,
 		RequestedUIPort: a.requestedUIPort,
 		UIPort:          a.uiPort,
-		PortMappings:    a.sortedPortMappings(),
+		PortMappings:    sortedPortMappingsFrom(a.portMap),
+		CSVRevision:     a.csvRevision,
+		LastReloadAt:    a.lastReloadAt,
+		ReloadError:     a.reloadError,
 	}
 }
 
@@ -991,6 +1373,7 @@ func (a *app) handleInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(a.info())
 }
@@ -1053,8 +1436,13 @@ func (a *app) writePostmanCollection(path string) error {
 }
 
 func (a *app) postmanCollectionJSON() ([]byte, error) {
-	items := make([]any, 0, len(a.interactions))
-	for _, row := range a.interactions {
+	a.stateMu.RLock()
+	rows := append([]interaction(nil), a.interactions...)
+	csvPath := a.csvPath
+	a.stateMu.RUnlock()
+
+	items := make([]any, 0, len(rows))
+	for _, row := range rows {
 		request := postmanRequest(row)
 		responseHeaders := make([]map[string]any, 0, len(row.ResponseHeaders))
 		for _, h := range row.ResponseHeaders {
@@ -1089,7 +1477,7 @@ func (a *app) postmanCollectionJSON() ([]byte, error) {
 		})
 	}
 
-	name := strings.TrimSuffix(filepath.Base(a.csvPath), filepath.Ext(a.csvPath))
+	name := strings.TrimSuffix(filepath.Base(csvPath), filepath.Ext(csvPath))
 	if name == "" || name == "." {
 		name = "HTTP Prototype"
 	}
@@ -1313,6 +1701,17 @@ func requestExistingShutdown(meta instanceMetadata) error {
 	return nil
 }
 
+func forceStopExisting(meta instanceMetadata) error {
+	if meta.PID <= 0 {
+		return errors.New("existing instance has no valid process ID")
+	}
+	process, err := os.FindProcess(meta.PID)
+	if err != nil {
+		return err
+	}
+	return process.Kill()
+}
+
 func waitForInstanceToStop(uiURL string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 250 * time.Millisecond}
@@ -1367,21 +1766,31 @@ func openBrowser(target string) error {
 
 func (a *app) shutdown() {
 	a.shutdownOnce.Do(func() {
-		a.mu.Lock()
-		defer a.mu.Unlock()
+		if a.done != nil {
+			close(a.done)
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
+
 		if a.uiServer != nil {
 			_ = a.uiServer.Shutdown(ctx)
-		}
-		for _, srv := range a.servers {
-			_ = srv.Shutdown(ctx)
 		}
 		if a.uiListener != nil {
 			_ = a.uiListener.Close()
 		}
-		for _, ln := range a.listeners {
-			_ = ln.Close()
+
+		a.mockMu.Lock()
+		mocks := make([]*mockServer, 0, len(a.mockServers))
+		for _, ms := range a.mockServers {
+			mocks = append(mocks, ms)
+		}
+		a.mockServers = make(map[int]*mockServer)
+		a.mockMu.Unlock()
+
+		for _, ms := range mocks {
+			_ = ms.server.Shutdown(ctx)
+			_ = ms.listener.Close()
 		}
 	})
 }

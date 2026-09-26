@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HTTP prototype</title>
 <style>
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f6f8fb}*{box-sizing:border-box}body{margin:0}.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 60px}.top{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:18px}h1{margin:0 0 6px;font-size:30px}p{margin:0;color:#5b6475}.top-actions{display:flex;gap:8px;flex-wrap:wrap}.banner{background:#fff8e8;border:1px solid #ead7a4;border-radius:10px;padding:12px 14px;margin-bottom:18px;color:#624b13}.banner strong{display:block;margin-bottom:5px}.banner code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.meta{font-size:12px;color:#788296;margin:0 0 18px}.card{background:#fff;border:1px solid #dfe4ec;border-radius:14px;box-shadow:0 2px 8px rgba(20,32,50,.05);margin:0 0 18px;overflow:hidden}.card-head{display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid #e9edf3}.method{font:700 12px ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef2f7;padding:5px 8px;border-radius:7px}.title{font-weight:700;flex:1}.url{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:#4f5d75;overflow-wrap:anywhere}.actions{display:flex;gap:8px}.btn{display:inline-block;border:1px solid #cfd6e2;background:#fff;color:#172033;text-decoration:none;border-radius:8px;padding:8px 11px;font-weight:650;cursor:pointer;font:inherit}.btn.primary{background:#172033;color:white;border-color:#172033}.btn:disabled{opacity:.55;cursor:wait}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0}.pane{padding:16px 18px;min-width:0}.pane+.pane{border-left:1px solid #e9edf3}.section{margin-bottom:16px}.label{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#788296;font-weight:750;margin-bottom:7px}pre{margin:0;padding:12px;background:#f7f9fc;border:1px solid #e4e9f0;border-radius:9px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:300px;overflow:auto}.response.empty{color:#8b94a5}.status{font-weight:750;margin-bottom:8px}.error{color:#a32222}.ok{color:#17693a}@media(max-width:800px){.top{display:block}.top-actions{margin-top:14px}.grid{grid-template-columns:1fr}.pane+.pane{border-left:0;border-top:1px solid #e9edf3}.actions{margin-top:12px}.card-head{align-items:flex-start;flex-wrap:wrap}}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f6f8fb}*{box-sizing:border-box}body{margin:0}.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 60px}.top{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:18px}h1{margin:0 0 6px;font-size:30px}p{margin:0;color:#5b6475}.top-actions{display:flex;gap:8px;flex-wrap:wrap}.banner{background:#fff8e8;border:1px solid #ead7a4;border-radius:10px;padding:12px 14px;margin-bottom:18px;color:#624b13}.banner strong{display:block;margin-bottom:5px}.banner code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.meta{font-size:12px;color:#788296;margin:0 0 8px}.reload-status{font-size:12px;margin:0 0 18px;padding:8px 10px;border-radius:8px;background:#eef7f1;color:#17693a}.reload-status.error{background:#fff0f0;color:#a32222}.reload-status.flash{background:#eef5ff;color:#2458a6}.card{background:#fff;border:1px solid #dfe4ec;border-radius:14px;box-shadow:0 2px 8px rgba(20,32,50,.05);margin:0 0 18px;overflow:hidden}.card-head{display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid #e9edf3}.method{font:700 12px ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef2f7;padding:5px 8px;border-radius:7px}.title{font-weight:700;flex:1}.url{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:#4f5d75;overflow-wrap:anywhere}.actions{display:flex;gap:8px}.btn{display:inline-block;border:1px solid #cfd6e2;background:#fff;color:#172033;text-decoration:none;border-radius:8px;padding:8px 11px;font-weight:650;cursor:pointer;font:inherit}.btn.primary{background:#172033;color:white;border-color:#172033}.btn:disabled{opacity:.55;cursor:wait}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0}.pane{padding:16px 18px;min-width:0}.pane+.pane{border-left:1px solid #e9edf3}.section{margin-bottom:16px}.label{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#788296;font-weight:750;margin-bottom:7px}pre{margin:0;padding:12px;background:#f7f9fc;border:1px solid #e4e9f0;border-radius:9px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:300px;overflow:auto}.response.empty{color:#8b94a5}.status{font-weight:750;margin-bottom:8px}.error{color:#a32222}.ok{color:#17693a}@media(max-width:800px){.top{display:block}.top-actions{margin-top:14px}.grid{grid-template-columns:1fr}.pane+.pane{border-left:0;border-top:1px solid #e9edf3}.actions{margin-top:12px}.card-head{align-items:flex-start;flex-wrap:wrap}}
 </style>
 </head>
 <body>
@@ -16,19 +16,33 @@
   </div>
   <div id="port-banner"></div>
   <div id="meta" class="meta"></div>
+  <div id="reload-status" class="reload-status">Live CSV reload is starting…</div>
   <div id="list"></div>
 </div>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const headersText=hs=>(hs||[]).map(h=>`${h.name}: ${h.value}`).join('\n') || '(none)';
-async function load(){
- const [infoRes,rowsRes]=await Promise.all([fetch('/api/info'),fetch('/api/interactions')]);
- if(!infoRes.ok||!rowsRes.ok) throw new Error('Could not load prototype data');
- const info=await infoRes.json(), rows=await rowsRes.json();
- renderInfo(info);
- document.querySelector('#list').innerHTML=rows.map(render).join('');
+let currentRevision=null;
+let loading=null;
+let flashTimer=null;
+
+async function load(options={}){
+ if(loading) return loading;
+ loading=(async()=>{
+  const [infoRes,rowsRes]=await Promise.all([
+   fetch('/api/info',{cache:'no-store'}),
+   fetch('/api/interactions',{cache:'no-store'})
+  ]);
+  if(!infoRes.ok||!rowsRes.ok) throw new Error('Could not load prototype data');
+  const info=await infoRes.json(), rows=await rowsRes.json();
+  currentRevision=info.csvRevision;
+  renderInfo(info,options);
+  document.querySelector('#list').innerHTML=rows.map(render).join('');
+ })();
+ try{return await loading} finally{loading=null}
 }
-function renderInfo(info){
+
+function renderInfo(info,options={}){
  const remapped=(info.portMappings||[]).filter(x=>x.requested!==x.effective);
  const uiRemapped=info.requestedUiPort>0&&info.requestedUiPort!==info.uiPort;
  const messages=[];
@@ -36,7 +50,28 @@ function renderInfo(info){
  if(uiRemapped) messages.push(`UI port <code>${info.requestedUiPort}</code> → <code>${info.uiPort}</code>`);
  document.querySelector('#port-banner').innerHTML=messages.length?`<div class="banner"><strong>Some requested ports were already in use, so free localhost ports were selected automatically.</strong>${messages.join('<br>')}<br>Generated cURLs and exported collections use these effective ports.</div>`:'';
  document.querySelector('#meta').textContent=`Build ${info.buildId} · ${info.csv}`;
+
+ const status=document.querySelector('#reload-status');
+ clearTimeout(flashTimer);
+ if(info.reloadError){
+  status.className='reload-status error';
+  status.textContent=`${info.reloadError} — continuing to use the previous valid CSV configuration.`;
+ }else if(options.announce){
+  status.className='reload-status flash';
+  status.textContent=options.announce;
+  flashTimer=setTimeout(()=>renderReloadReady(info),2500);
+ }else{
+  renderReloadReady(info);
+ }
 }
+
+function renderReloadReady(info){
+ const status=document.querySelector('#reload-status');
+ status.className='reload-status';
+ const when=info.lastReloadAt?new Date(info.lastReloadAt).toLocaleTimeString():'startup';
+ status.textContent=`Live CSV reload active · revision ${info.csvRevision} · last loaded ${when}`;
+}
+
 function render(r){
  const label=r.name?esc(r.name):`Request ${r.id}`;
  const portNote=r.effectivePort!==r.port?` <span title="Requested port ${r.port}; automatically remapped">(requested ${r.port})</span>`:'';
@@ -56,22 +91,60 @@ function render(r){
   </div>
  </article>`;
 }
+
 async function copyCurl(id){
  const text=document.querySelector(`#curl-${id}`).textContent;
  await navigator.clipboard.writeText(text);
  const btn=document.querySelector(`#row-${id} .btn`); const old=btn.textContent; btn.textContent='Copied'; setTimeout(()=>btn.textContent=old,900);
 }
+
 async function sendReq(id){
  const btn=document.querySelector(`#send-${id}`), box=document.querySelector(`#result-${id}`); btn.disabled=true; box.className='response'; box.textContent='Sending…';
  try{
-  const res=await fetch(`/api/execute?id=${id}`,{method:'POST'}); const text=await res.text();
+  const res=await fetch(`/api/execute?id=${id}`,{method:'POST',cache:'no-store'}); const text=await res.text();
   if(!res.ok){box.className='response error'; box.innerHTML=`<pre>${esc(text)}</pre>`; return}
   const x=JSON.parse(text); const hs=Object.entries(x.headers||{}).flatMap(([k,vs])=>vs.map(v=>`${k}: ${v}`)).join('\n');
   box.className=`response ${x.statusCode>=200&&x.statusCode<400?'ok':''}`;
   box.innerHTML=`<div class="status">${esc(x.status)} · ${x.durationMs} ms</div><pre>${esc(hs||'(none)')}</pre><div style="height:8px"></div><pre>${esc(x.bodyDisplay||x.body||'(empty)')}</pre>`;
  }catch(e){box.className='response error'; box.textContent=e.message} finally{btn.disabled=false}
 }
-load().catch(e=>document.querySelector('#list').innerHTML=`<div class="error">${esc(e.message)}</div>`);
+
+async function checkRevision(){
+ try{
+  const res=await fetch('/api/info',{cache:'no-store'});
+  if(!res.ok) return;
+  const info=await res.json();
+  if(currentRevision===null||info.csvRevision!==currentRevision||info.reloadError){
+   await load({announce:info.reloadError?'':`CSV automatically reloaded · revision ${info.csvRevision}`});
+  }
+ }catch(_){}
+}
+
+function connectLiveReload(){
+ if(!window.EventSource){
+  setInterval(checkRevision,2000);
+  return;
+ }
+ const events=new EventSource('/api/events');
+ events.onmessage=async e=>{
+  try{
+   const event=JSON.parse(e.data);
+   if(event.type==='connected') return;
+   if(event.type==='csv-reloaded'){
+    await load({announce:event.message||'CSV automatically reloaded.'});
+   }else if(event.type==='csv-error'){
+    await load();
+   }
+  }catch(_){}
+ };
+ // EventSource reconnects automatically. A slow fallback poll also ensures the
+ // page catches up after laptop sleep, proxy buffering, or a dropped stream.
+ setInterval(checkRevision,5000);
+}
+
+load()
+ .then(connectLiveReload)
+ .catch(e=>document.querySelector('#list').innerHTML=`<div class="error">${esc(e.message)}</div>`);
 </script>
 </body>
 </html>
