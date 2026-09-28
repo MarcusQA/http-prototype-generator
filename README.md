@@ -9,6 +9,7 @@ A zero-runtime-dependency localhost HTTP prototype driven by a CSV file. Each CS
 The app watches `http_values.csv` while it is running. Saving the CSV in Excel, LibreOffice, Numbers, or another editor automatically reloads the prototype; you do **not** need to restart the executable or refresh the browser manually.
 
 - The file is checked for content changes several times per second using a SHA-256 fingerprint, so atomic-save/rename behaviour from spreadsheet editors is handled reliably.
+- **Windows replacement-safe reads.** The app opens `http_values.csv` with read/write/delete sharing while it reads it, so Explorer, scripts, and editors that save by rename/replace are not blocked by the prototype's brief read handle. Excel or another editor may still impose its own file lock independently of this app.
 - Valid changes are parsed and applied atomically.
 - The browser receives a Server-Sent Event (SSE) and refreshes the request cards immediately.
 - A slow browser-side revision poll is retained as a fallback after sleep/network interruption.
